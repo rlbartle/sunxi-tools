@@ -30,15 +30,17 @@ typedef struct {
 	uint32_t  id;
 	uint8_t   write_enable_cmd;
 	uint8_t   large_erase_cmd;
-	uint32_t  large_erase_size;
 	uint8_t   small_erase_cmd;
-	uint32_t  small_erase_size;
 	uint8_t   program_cmd;
+	bool      plane_select;
+	bool      is_nand;
+	uint16_t  small_erase_size;
+	uint32_t  large_erase_size;
 	uint32_t  program_size;
 	char     *text_description;
 } spi_flash_info_t;
 
-spi_flash_info_t spi_flash_info[] = {
+static spi_flash_info_t spi_flash_info_list[] = {
 	{ .id = 0xEF40, .write_enable_cmd = 0x6,
 	  .large_erase_cmd = 0xD8, .large_erase_size = 64 * 1024,
 	  .small_erase_cmd = 0x20, .small_erase_size =  4 * 1024,
@@ -54,15 +56,28 @@ spi_flash_info_t spi_flash_info[] = {
 	  .small_erase_cmd = 0x20, .small_erase_size =  4 * 1024,
 	  .program_cmd = 0x02, .program_size = 256,
 	  .text_description = "Eon EN25QHxx" },
+	{ .id = 0x002C2400, .write_enable_cmd = 0x6,
+	  .large_erase_cmd = 0xD8, .large_erase_size = 128 * 1024,
+	  .program_cmd = 0x02, .program_size = 2048,
+	  .plane_select = true, .is_nand = true,
+	  .text_description = "Micron MT29F2xxxx" },
+	{ .id = 0x002C1400, .write_enable_cmd = 0x6,
+	  .large_erase_cmd = 0xD8, .large_erase_size = 128 * 1024,
+	  .program_cmd = 0x02, .program_size = 2048,
+	  .plane_select = false, .is_nand = true,
+	  .text_description = "Micron MT29F1xxxx" },
+	{ .text_description = NULL }
 };
 
-spi_flash_info_t default_spi_flash_info = {
+static spi_flash_info_t default_spi_flash_info = {
 	.id = 0x0000, .write_enable_cmd = 0x6,
 	.large_erase_cmd = 0xD8, .large_erase_size = 64 * 1024,
 	.small_erase_cmd = 0x20, .small_erase_size =  4 * 1024,
 	.program_cmd = 0x02, .program_size = 256,
 	.text_description = "Unknown",
 };
+
+static spi_flash_info_t *spi_flash_info;
 
 /*****************************************************************************/
 
@@ -117,10 +132,35 @@ void fel_writel(feldev_handle *dev, uint32_t addr, uint32_t val);
 #define SUN6I_SPI0_TXD              (spi_base(dev) + 0x200)
 #define SUN6I_SPI0_RXD              (spi_base(dev) + 0x300)
 
+#define CCM_SPI0_CLK_DIV_NONE       (0x1000)
 #define CCM_SPI0_CLK_DIV_BY_2       (0x1000)
 #define CCM_SPI0_CLK_DIV_BY_4       (0x1001)
 #define CCM_SPI0_CLK_DIV_BY_6       (0x1002)
 #define CCM_SPI0_CLK_DIV_BY_32      (0x100f)
+
+static spi_flash_info_t* get_spi_flash_info(uint32_t id)
+{
+	if (id == 0)
+		return NULL;
+	spi_flash_info_t* ptr = spi_flash_info_list;
+	while (ptr->text_description != NULL) {
+		if (id == ptr->id) {
+			return ptr;
+		}
+		++ptr;
+	}
+	
+	//When using the default info (for unknown flash), then if it is NAND set appropriate defaults.
+	if (((id >> 24) & 0xFF) == 0) {
+		default_spi_flash_info.is_nand = true;
+		//NAND most commonly uses 128KB erase blocks
+		default_spi_flash_info.large_erase_size = 128 * 1024;
+		//Page size is usually 2048, and programable size surely accomodates it
+		default_spi_flash_info.program_size = 2048;
+	}
+	default_spi_flash_info.id = id;
+	return &default_spi_flash_info;
+}
 
 static uint32_t gpio_base(feldev_handle *dev)
 {
@@ -297,12 +337,12 @@ static bool spi0_init(feldev_handle *dev)
 		/* divide by 32 */
 		writel(CCM_SPI0_CLK_DIV_BY_32, SUN6I_SPI0_CCTL);
 	} else {
-		/* divide 24MHz OSC by 4 */
-		writel(CCM_SPI0_CLK_DIV_BY_4,
+		/* No divide */
+		writel(CCM_SPI0_CLK_DIV_NONE,
 		       spi_is_sun6i(dev) ? SUN6I_SPI0_CCTL : SUN4I_SPI0_CCTL);
 		/* Choose 24MHz from OSC24M and enable clock */
 		writel(1U << 31,
-		       soc_is_h6_style(dev) ? H6_CCM_SPI0_CLK : CCM_SPI0_CLK);
+			   soc_is_h6_style(dev) ? H6_CCM_SPI0_CLK : CCM_SPI0_CLK);
 	}
 
 	if (spi_is_sun6i(dev)) {
@@ -371,27 +411,121 @@ static void prepare_spi_batch_data_transfer(feldev_handle *dev, uint32_t buf)
 }
 
 /*
- * Read data from the SPI flash. Use the first 4KiB of SRAM as the data buffer.
+ * Use the read JEDEC ID (9Fh) command.
  */
-void aw_fel_spiflash_read(feldev_handle *dev,
-			  uint32_t offset, void *buf, size_t len,
-			  progress_cb_t progress)
+static uint32_t read_jedec_id(feldev_handle *dev)
 {
 	soc_info_t *soc_info = dev->soc_info;
+	unsigned char buf[] = { 0, 4, 0x9F, 0, 0, 0, 0x0, 0x0 };
 	void *backup = backup_sram(dev);
-	uint8_t *buf8 = (uint8_t *)buf;
-	size_t max_chunk_size = soc_info->scratch_addr - soc_info->spl_addr;
-	if (max_chunk_size > 0x1000)
-		max_chunk_size = 0x1000;
-	uint8_t *cmdbuf = malloc(max_chunk_size);
-	memset(cmdbuf, 0, max_chunk_size);
-	aw_fel_write(dev, cmdbuf, soc_info->spl_addr, max_chunk_size);
 
 	if (!spi0_init(dev))
-		return;
+		return 0;
 
+	aw_fel_write(dev, buf, soc_info->spl_addr, sizeof(buf));
 	prepare_spi_batch_data_transfer(dev, soc_info->spl_addr);
+	aw_fel_remotefunc_execute(dev, NULL);
+	aw_fel_read(dev, soc_info->spl_addr, buf, sizeof(buf));
 
+	restore_sram(dev, backup);
+
+	// printf("read_jedec_id [%.2Xh, %.2Xh, %.2Xh, %.2Xh, %.2Xh, %.2Xh, %.2Xh, %.2Xh] \n",
+	// 	   buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+
+	/* Assume that the MISO pin is either pulled up or down */
+	if (buf[5] == 0x00 || buf[5] == 0xFF) {
+		printf("No SPI flash detected.\n");
+		return 0;
+	}
+
+	return (buf[3] << 24) | (buf[4] << 16) | (buf[5] << 8) | buf[6];
+}
+
+/* Read Page to Cache */
+static void spi_nand_load_page(feldev_handle *dev, uint8_t *cmdbuf, uint32_t addr) {
+	soc_info_t *soc_info = dev->soc_info;
+	/* Emit the Read Page (13h) command */
+	cmdbuf[0] = 0;
+	cmdbuf[1] = 4;
+	cmdbuf[2] = 0x13;
+	cmdbuf[3] = addr >> 16;
+	cmdbuf[4] = addr >> 8;
+	cmdbuf[5] = addr;
+	/* Emit wait for completion */
+	cmdbuf[6] = 0xFF;
+	cmdbuf[7] = 0xFF;
+	/* Emit the end marker */
+	cmdbuf[8] = 0;
+	cmdbuf[9] = 0;
+
+	aw_fel_write(dev, cmdbuf, soc_info->spl_addr, 10);
+	aw_fel_remotefunc_execute(dev, NULL);
+}
+
+static void spi_nand_read_cache(feldev_handle *dev, uint8_t *cmdbuf, size_t max_chunk_size,
+						uint8_t *buf, uint32_t offset, size_t chunk_size)
+{
+	soc_info_t *soc_info = dev->soc_info;
+	/* When the NAND has 2 planes, then bit 12 is set when the block being used is odd numbered. */
+	uint16_t addr = offset & 0x7FF;
+	if (spi_flash_info->plane_select && ((offset / spi_flash_info->large_erase_size) % 2))
+		addr |= 0x1000;
+
+	/* Emit the Read From Cache (0Bh) command */
+	cmdbuf[0] = (chunk_size + 4) >> 8;
+	cmdbuf[1] = (chunk_size + 4);
+	cmdbuf[2] = 0x0B;
+	cmdbuf[3] = addr >> 8;
+	cmdbuf[4] = addr;
+	cmdbuf[5] = 0; //dummy burst byte
+	
+	if (chunk_size == max_chunk_size - 8)
+		aw_fel_write(dev, cmdbuf, soc_info->spl_addr, 6);
+	else
+		aw_fel_write(dev, cmdbuf, soc_info->spl_addr, chunk_size + 8);
+	aw_fel_remotefunc_execute(dev, NULL);
+	aw_fel_read(dev, soc_info->spl_addr + 6, buf, chunk_size);
+}
+
+static void spi_nand_read(feldev_handle *dev, uint8_t *cmdbuf, size_t max_chunk_size,
+						uint32_t offset, uint8_t *buf, size_t len,
+						progress_cb_t progress)
+{
+	// Page size:  spi_flash_info->program_size
+	const uint32_t page_shift = 11; //2KiB page size
+	size_t page_chunk_max_size = max_chunk_size - 8;
+	if (page_chunk_max_size > 2048)
+		page_chunk_max_size = 2048;
+
+	uint32_t chunk_size;
+	uint32_t curr_page;
+	uint32_t last_page = -1;
+	progress_start(progress, len);
+	while (len > 0) {
+		curr_page = offset >> page_shift;
+		if (curr_page != last_page) {
+			spi_nand_load_page(dev, cmdbuf, curr_page);
+			last_page = curr_page;
+		}
+
+		chunk_size = (len > max_chunk_size - 8) ? max_chunk_size - 8 : len;
+		if (((offset + chunk_size) >> page_shift) > curr_page)
+			chunk_size = ((curr_page + 1) << page_shift) - offset;
+
+		memset(cmdbuf, 0, page_chunk_max_size + 8);
+		spi_nand_read_cache(dev, cmdbuf, page_chunk_max_size, buf, offset, chunk_size);
+		len -= chunk_size;
+		buf += chunk_size;
+		offset += chunk_size;
+		progress_update(chunk_size);
+	}
+}
+
+static void spi_nor_read(feldev_handle *dev, uint8_t *cmdbuf, size_t max_chunk_size,
+						  uint32_t offset, uint8_t *buf, size_t len,
+						  progress_cb_t progress)
+{
+	soc_info_t *soc_info = dev->soc_info;
 	progress_start(progress, len);
 	while (len > 0) {
 		size_t chunk_size = len;
@@ -411,12 +545,39 @@ void aw_fel_spiflash_read(feldev_handle *dev,
 		else
 			aw_fel_write(dev, cmdbuf, soc_info->spl_addr, chunk_size + 8);
 		aw_fel_remotefunc_execute(dev, NULL);
-		aw_fel_read(dev, soc_info->spl_addr + 6, buf8, chunk_size);
+		aw_fel_read(dev, soc_info->spl_addr + 6, buf, chunk_size);
 
 		len -= chunk_size;
 		offset += chunk_size;
-		buf8 += chunk_size;
+		buf += chunk_size;
 		progress_update(chunk_size);
+	}
+}
+
+/*
+ * Read data from the SPI flash. Use the first 4KiB of SRAM as the data buffer.
+ */
+void aw_fel_spiflash_read(feldev_handle *dev,
+			  uint32_t offset, void *buf, size_t len,
+			  progress_cb_t progress)
+{
+	if (!spi_flash_info)
+		spi_flash_info = get_spi_flash_info(read_jedec_id(dev));
+	if (!spi_flash_info)
+		return;
+
+	soc_info_t *soc_info = dev->soc_info;
+	void *backup = backup_sram(dev);
+	size_t max_chunk_size = soc_info->scratch_addr - soc_info->spl_addr;
+	if (max_chunk_size > 0x1000)
+		max_chunk_size = 0x1000;
+	uint8_t *cmdbuf = malloc(max_chunk_size);
+	prepare_spi_batch_data_transfer(dev, soc_info->spl_addr);
+
+	if (spi_flash_info->is_nand) {
+		spi_nand_read(dev, cmdbuf, max_chunk_size, offset, buf, len, progress);
+	} else {
+		spi_nor_read(dev, cmdbuf, max_chunk_size, offset, buf, len, progress);
 	}
 
 	free(cmdbuf);
@@ -428,6 +589,7 @@ void aw_fel_spiflash_read(feldev_handle *dev,
  */
 
 #define CMD_WRITE_ENABLE 0x06
+#define CMD_PROGRAM_EXEC 0x10
 
 void aw_fel_spiflash_write_helper(feldev_handle *dev,
 				  uint32_t offset, void *buf, size_t len,
@@ -475,14 +637,42 @@ void aw_fel_spiflash_write_helper(feldev_handle *dev,
 			cmdbuf[cmd_idx++] = (4 + write_count) >> 8;
 			cmdbuf[cmd_idx++] = 4 + write_count;
 			cmdbuf[cmd_idx++] = program_cmd;
-			cmdbuf[cmd_idx++] = offset >> 16;
-			cmdbuf[cmd_idx++] = offset >> 8;
-			cmdbuf[cmd_idx++] = offset;
+
+			if (spi_flash_info->is_nand) {
+				/* When the NAND has 2 planes, then bit 12 is set when the block being used is odd numbered. */
+				uint16_t addr = offset & 0x7FF;
+				if (spi_flash_info->plane_select && ((offset / spi_flash_info->large_erase_size) % 2))
+					addr |= 0x1000;
+				cmdbuf[cmd_idx++] = addr >> 8;
+				cmdbuf[cmd_idx++] = addr;
+			} else {
+				cmdbuf[cmd_idx++] = offset >> 16;
+				cmdbuf[cmd_idx++] = offset >> 8;
+				cmdbuf[cmd_idx++] = offset;
+			}
 			memcpy(cmdbuf + cmd_idx, buf8, write_count);
 			cmd_idx += write_count;
 			buf8    += write_count;
 			len     -= write_count;
 			offset  += write_count;
+
+			if (spi_flash_info->is_nand) {
+				/* Emit wait for completion */
+				cmdbuf[cmd_idx++] = 0xFF;
+				cmdbuf[cmd_idx++] = 0xFF;
+				/* Emit program execute command */
+				cmdbuf[cmd_idx++] = 0;
+				cmdbuf[cmd_idx++] = 4;
+				cmdbuf[cmd_idx++] = CMD_PROGRAM_EXEC;
+
+				// Page size:  spi_flash_info->program_size
+				const uint32_t page_shift = 11; //2KiB page size
+				uint16_t addr = (offset - write_count) >> page_shift;
+				cmdbuf[cmd_idx++] = addr >> 16;
+				cmdbuf[cmd_idx++] = addr >> 8;
+				cmdbuf[cmd_idx++] = addr;
+			}
+
 			/* Emit wait for completion */
 			cmdbuf[cmd_idx++] = 0xFF;
 			cmdbuf[cmd_idx++] = 0xFF;
@@ -506,39 +696,39 @@ void aw_fel_spiflash_write(feldev_handle *dev,
 {
 	void *backup = backup_sram(dev);
 	uint8_t *buf8 = (uint8_t *)buf;
+	
+	if (!spi_flash_info)
+		spi_flash_info = get_spi_flash_info(read_jedec_id(dev));
+	if (!spi_flash_info)
+		return;
 
-	spi_flash_info_t *flash_info = &default_spi_flash_info; /* FIXME */
-
-	if ((offset % flash_info->small_erase_size) != 0) {
+	if ((offset % spi_flash_info->small_erase_size) != 0) {
 		fprintf(stderr, "aw_fel_spiflash_write: 'addr' must be %d bytes aligned\n",
-		        flash_info->small_erase_size);
+		        spi_flash_info->small_erase_size);
 		exit(1);
 	}
-
-	if (!spi0_init(dev))
-		return;
 
 	progress_start(progress, len);
 	while (len > 0) {
 		size_t write_count;
-		if ((offset % flash_info->large_erase_size) != 0 ||
-							len < flash_info->large_erase_size) {
-
-			write_count = flash_info->small_erase_size;
+		if (!spi_flash_info->is_nand && 
+					((offset % spi_flash_info->large_erase_size) != 0 ||
+						len < spi_flash_info->large_erase_size)) {
+			write_count = spi_flash_info->small_erase_size;
 			if (write_count > len)
 				write_count = len;
 			aw_fel_spiflash_write_helper(dev, offset, buf8,
 				write_count,
-				flash_info->small_erase_size, flash_info->small_erase_cmd,
-				flash_info->program_size, flash_info->program_cmd);
+				spi_flash_info->small_erase_size, spi_flash_info->small_erase_cmd,
+				spi_flash_info->program_size, spi_flash_info->program_cmd);
 		} else {
-			write_count = flash_info->large_erase_size;
+			write_count = spi_flash_info->large_erase_size;
 			if (write_count > len)
 				write_count = len;
 			aw_fel_spiflash_write_helper(dev, offset, buf8,
 				write_count,
-				flash_info->large_erase_size, flash_info->large_erase_cmd,
-				flash_info->program_size, flash_info->program_cmd);
+				spi_flash_info->large_erase_size, spi_flash_info->large_erase_cmd,
+				spi_flash_info->program_size, spi_flash_info->program_cmd);
 		}
 
 		len    -= write_count;
@@ -551,32 +741,20 @@ void aw_fel_spiflash_write(feldev_handle *dev,
 }
 
 /*
- * Use the read JEDEC ID (9Fh) command.
+ * Determine the device ID and derive manufacturer and model for display.
  */
 void aw_fel_spiflash_info(feldev_handle *dev)
 {
-	soc_info_t *soc_info = dev->soc_info;
+	uint32_t id = read_jedec_id(dev);
 	const char *manufacturer;
-	unsigned char buf[] = { 0, 4, 0x9F, 0, 0, 0, 0x0, 0x0 };
-	void *backup = backup_sram(dev);
 
-	if (!spi0_init(dev))
+	if (id == 0)
 		return;
 
-	aw_fel_write(dev, buf, soc_info->spl_addr, sizeof(buf));
-	prepare_spi_batch_data_transfer(dev, soc_info->spl_addr);
-	aw_fel_remotefunc_execute(dev, NULL);
-	aw_fel_read(dev, soc_info->spl_addr, buf, sizeof(buf));
+	if (!spi_flash_info)
+		spi_flash_info = get_spi_flash_info(id);
 
-	restore_sram(dev, backup);
-
-	/* Assume that the MISO pin is either pulled up or down */
-	if (buf[5] == 0x00 || buf[5] == 0xFF) {
-		printf("No SPI flash detected.\n");
-		return;
-	}
-
-	switch (buf[3]) {
+	switch (spi_flash_info->is_nand ? (id >> 16) & 0xFF : (id >> 24) & 0xFF) {
 	case 0xEF:
 		manufacturer = "Winbond";
 		break;
@@ -586,13 +764,20 @@ void aw_fel_spiflash_info(feldev_handle *dev)
 	case 0x1C:
 		manufacturer = "Eon";
 		break;
+	case 0x2C:
+		manufacturer = "Micron";
+		break;
 	default:
 		manufacturer = "Unknown";
 		break;
 	}
 
-	printf("Manufacturer: %s (%02Xh), model: %02Xh, size: %d bytes.\n",
-	       manufacturer, buf[3], buf[4], (1U << buf[5]));
+	if (spi_flash_info->is_nand)
+		printf("Manufacturer: %s (%02Xh), model: %02Xh\n",
+			   manufacturer, (id >> 16) & 0xFF, (id >> 8) & 0xFF);
+	else
+		printf("Manufacturer: %s (%02Xh), model: %02Xh, size: %d bytes.\n",
+			manufacturer, (id >> 24) & 0xFF, (id >> 16) & 0xFF, (1U << (id >> 8) & 0xFF));
 }
 
 /*
